@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Symbol Cipher</title>
+<style>
+  :root { --bg:#12141c; --panel:#1c2030; --line:#2e3550; --text:#e8ebf5; --dim:#98a0bd; --accent:#7aa2ff; --bad:#ff7a7a; --good:#7dffb0; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 "Segoe UI", system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { margin:0 0 4px; font-size:28px; }
+  p.sub { margin:0 0 20px; color:var(--dim); }
+  label { display:block; margin:16px 0 6px; font-weight:600; }
+  textarea, input { width:100%; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px 12px; font:inherit; }
+  textarea { min-height:120px; resize:vertical; }
+  #output { font-size:20px; line-height:1.7; word-break:break-all; font-family:"Segoe UI Symbol","Segoe UI Emoji",sans-serif; }
+  textarea:focus, input:focus { outline:2px solid var(--accent); outline-offset:1px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+  button { background:var(--accent); color:#0b1020; border:0; border-radius:8px; padding:10px 18px; font:inherit; font-weight:700; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:wait; }
+  #status { min-height:24px; margin-top:12px; color:var(--dim); }
+  #status.bad { color:var(--bad); } #status.good { color:var(--good); }
+  .note { margin-top:28px; padding:14px 16px; background:var(--panel); border:1px solid var(--line); border-radius:8px; color:var(--dim); font-size:14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>☄ Symbol Cipher</h1>
+  <p class="sub">Real AES-256 encryption, written out in symbols. Only someone with the password can read it.</p>
+
+  <label for="password">Password</label>
+  <input id="password" type="password" placeholder="A long secret phrase works best" autocomplete="off">
+  <div class="row" style="margin-top:8px">
+    <button class="ghost" id="showpw" type="button">Show password</button>
+  </div>
+
+  <label for="input">Message, or symbols to decode</label>
+  <textarea id="input" placeholder="Type a message here, or paste symbols"></textarea>
+
+  <div class="row">
+    <button id="enc" type="button">Encrypt</button>
+    <button id="dec" type="button">Decrypt</button>
+  </div>
+  <div id="status"></div>
+
+  <label for="output">Result</label>
+  <textarea id="output" readonly></textarea>
+  <div class="row">
+    <button class="ghost" id="copy" type="button">Copy result</button>
+  </div>
+
+  <div class="note">
+    Everything happens on this computer; nothing is sent anywhere. The same message encrypts to different symbols every time.
+    If the password is lost, the message is gone for good.
+  </div>
+</main>
+
+<script>
+// ---- core (no page access, so it can be tested on its own) ----
+const BASE = 0x2600;          // U+2600..U+26FF: 256 symbols, one per byte
+const ITERATIONS = 600000;    // PBKDF2 rounds: makes password guessing slow
+const VERSION = 1;
+
+function toSymbols(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(BASE + b);
+  return s;
+}
+
+function fromSymbols(str) {
+  const out = [];
+  for (const ch of str) {
+    const c = ch.codePointAt(0);
+    if (c >= BASE && c < BASE + 256) out.push(c - BASE);
+    else if (/\s/.test(ch) || c === 0xFE0F || c === 0xFE0E) continue; // spaces, emoji-style markers
+    else throw new Error('That contains something that is not a cipher symbol.');
+  }
+  return new Uint8Array(out);
+}
+
+async function deriveKey(password, salt) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: ITERATIONS, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+// Layout: version(1) | salt(16) | iv(12) | ciphertext+tag
+async function encryptMessage(text, password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(password, salt);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text)));
+  const all = new Uint8Array(1 + 16 + 12 + ct.length);
+  all[0] = VERSION; all.set(salt, 1); all.set(iv, 17); all.set(ct, 29);
+  return toSymbols(all);
+}
+
+async function decryptMessage(symbols, password) {
+  const all = fromSymbols(symbols);
+  if (all.length < 1 + 16 + 12 + 16 || all[0] !== VERSION) throw new Error('That does not look like a full Symbol Cipher message.');
+  const key = await deriveKey(password, all.slice(1, 17));
+  let pt;
+  try {
+    pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: all.slice(17, 29) }, key, all.slice(29));
+  } catch {
+    throw new Error('Wrong password, or the message was changed.');
+  }
+  return new TextDecoder().decode(pt);
+}
+
+// ---- page ----
+if (typeof document !== 'undefined') {
+  const $ = id => document.getElementById(id);
+  const status = (msg, cls = '') => { $('status').textContent = msg; $('status').className = cls; };
+
+  async function run(fn, working) {
+    const pw = $('password').value, text = $('input').value;
+    if (!pw) return status('Type a password first.', 'bad');
+    if (!text.trim()) return status('Type or paste something first.', 'bad');
+    $('enc').disabled = $('dec').disabled = true;
+    status(working);
+    try {
+      $('output').value = await fn(text, pw);
+      status('Done.', 'good');
+    } catch (e) {
+      $('output').value = '';
+      status(e.message, 'bad');
+    }
+    $('enc').disabled = $('dec').disabled = false;
+  }
+
+  $('enc').onclick = () => run(encryptMessage, 'Encrypting…');
+  $('dec').onclick = () => run(decryptMessage, 'Decrypting…');
+  $('showpw').onclick = () => {
+    const hidden = $('password').type === 'password';
+    $('password').type = hidden ? 'text' : 'password';
+    $('showpw').textContent = hidden ? 'Hide password' : 'Show password';
+  };
+  $('copy').onclick = async () => {
+    if (!$('output').value) return;
+    try { await navigator.clipboard.writeText($('output').value); status('Copied.', 'good'); }
+    catch { $('output').select(); status('Press Ctrl+C to copy.'); }
+  };
+  if (!globalThis.crypto || !crypto.subtle) status('This browser is blocking encryption here. Try Chrome, Edge or Firefox.', 'bad');
+}
+</script>
+</body>
+</html>
